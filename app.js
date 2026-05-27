@@ -517,17 +517,17 @@ function parseVersionResponse(resp) {
 }
 
 async function queryFirmwareVersion() {
-  log("查询设备固件版本...");
+  log("查询设备返回版本...");
   const resp = await sendAndWait(buildControlCommand(CMD.VERSION_QUERY, []), TIMEOUT_VERSION_QUERY, isUpgradeResponse);
   const version = parseVersionResponse(resp);
   if (!version) {
-    log(`设备版本响应无法解析: ${bytesToHex(resp) || "-"}`);
+    log(`设备返回版本响应无法解析: ${bytesToHex(resp) || "-"}`);
     return "";
   }
   state.detectedVersion = version;
-  state.currentVersion = version.replace(/^V/i, "");
-  if (els.currentVersion) els.currentVersion.textContent = version;
-  log(`设备固件版本: ${version}`);
+  state.currentVersion = CURRENT_VERSION;
+  if (els.currentVersion) els.currentVersion.textContent = CURRENT_VERSION;
+  log(`设备返回版本: ${version}；当前版本固定按 ${CURRENT_VERSION} 显示和上报`);
   return version;
 }
 
