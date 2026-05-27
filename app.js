@@ -1,5 +1,11 @@
 const API_URL = "https://xhc.xhsmartpiano.com/device/firmware/check";
 const FIRMWARE_PROXY_URL = "/api/firmware/proxy";
+const LOCAL_BRIDGE_ORIGIN = "http://127.0.0.1:18080";
+const BRIDGE_BASE_URL = ["127.0.0.1", "localhost"].includes(location.hostname) ? "" : LOCAL_BRIDGE_ORIGIN;
+const BRIDGE_STATUS_URL = `${BRIDGE_BASE_URL}/api/bridge/status`;
+const NATIVE_USB_PROBE_URL = `${BRIDGE_BASE_URL}/api/device/probe`;
+const NATIVE_USB_UPGRADE_URL = `${BRIDGE_BASE_URL}/api/firmware/upgrade`;
+const WINDOWS_WEBUSB_MODE = document.documentElement.dataset.platform === "windows-webusb";
 const CURRENT_VERSION = "1.3.2";
 const APP_ID = "com.hsinghai.hsinghaipiano";
 const APP_BUILD = "202605221619";
@@ -14,8 +20,21 @@ const CMD = {
 };
 const RESP = { ACK: 0x06, CRC_ERROR: 0x13 };
 const ETX = 0xF7;
+const PARAM_TRANSFER_END = 0x04;
 const LINES_PER_CMD = 128;
 const MAX_RETRY = 3;
+const TIMEOUT_VERSION_QUERY = 3000;
+const TIMEOUT_INIT = 5000;
+const TIMEOUT_DATA_TRANSFER = 5000;
+const TIMEOUT_FINISH = 10000;
+const USB_MIDI_SEND_CHUNK_SIZE = 64;
+const USB_MIDI_SEND_CHUNK_DELAY_MS = 2;
+const SOUNDWALKER_VENDOR_ID = 0x5952;
+const SOUNDWALKER_PRODUCT_ID = 0x4E41;
+const WEB_USB_DEVICE_FILTERS = [
+  { vendorId: SOUNDWALKER_VENDOR_ID, productId: SOUNDWALKER_PRODUCT_ID },
+  { classCode: 0x01, subclassCode: 0x03 },
+];
 
 const els = {
   connectBtn: document.getElementById("connectBtn"),
@@ -25,6 +44,7 @@ const els = {
   firmwareFileInput: document.getElementById("firmwareFileInput"),
   connStatus: document.getElementById("connStatus"),
   deviceName: document.getElementById("deviceName"),
+  transportName: document.getElementById("transportName"),
   currentVersion: document.getElementById("currentVersion"),
   latestVersion: document.getElementById("latestVersion"),
   fileSize: document.getElementById("fileSize"),
@@ -36,102 +56,25 @@ const els = {
 };
 
 const state = {
-  midiAccess: null,
-  input: null,
-  output: null,
   transportType: "none",
   sendPacket: null,
   usbDevice: null,
   usbOutEndpoint: null,
   usbInEndpoint: null,
+  usbOutPacketSize: USB_MIDI_SEND_CHUNK_SIZE,
   usbReadLoopRunning: false,
   usbRxBuffer: [],
   responseWaiter: null,
   firmwareInfo: null,
   rawDisplayName: "",
   currentVersion: CURRENT_VERSION,
+  detectedVersion: "",
   localFirmwareLines: null,
   localFirmwareName: "",
 };
 
-function getMidiDisplayName(port) {
-  if (!port) return "";
-  // Web MIDI没有直接暴露kMIDIPropertyDisplayName，优先用name近似映射
-  return (port.name || "").trim();
-}
-
-function isTupTupName(name) {
-  return /^tuptup/i.test((name || "").trim());
-}
-
 function isSoundWalkerName(name) {
   return /soundwalker/i.test((name || "").trim());
-}
-
-function selectTargetPorts(inputs, outputs) {
-  const inputInfos = inputs.map((port) => ({ port, name: getMidiDisplayName(port) }));
-  const outputInfos = outputs.map((port) => ({ port, name: getMidiDisplayName(port) }));
-
-  // 1) 优先选 TupTup* 的同名输入输出对
-  for (const out of outputInfos) {
-    if (!isTupTupName(out.name)) continue;
-    const matchedInput = inputInfos.find((i) => i.name === out.name && isTupTupName(i.name));
-    if (matchedInput) {
-      return {
-        input: matchedInput.port,
-        output: out.port,
-        displayName: out.name,
-        reason: "matched_tuptup_pair",
-      };
-    }
-  }
-
-  // 2) 次优：任意 TupTup* 输出，输入用同名或第一个
-  const tupOut = outputInfos.find((o) => isTupTupName(o.name));
-  if (tupOut) {
-    const matchedInput = inputInfos.find((i) => i.name === tupOut.name) || inputInfos[0];
-    return {
-      input: matchedInput.port,
-      output: tupOut.port,
-      displayName: tupOut.name,
-      reason: "tuptup_output_fallback_input",
-    };
-  }
-
-  // 3) Web侧常见业务端口：SoundWalker MIDI，优先于SAM5704芯片端口
-  for (const out of outputInfos) {
-    if (!isSoundWalkerName(out.name)) continue;
-    const matchedInput =
-      inputInfos.find((i) => i.name === out.name) ||
-      inputInfos.find((i) => isSoundWalkerName(i.name)) ||
-      inputInfos[0];
-    return {
-      input: matchedInput.port,
-      output: out.port,
-      displayName: out.name,
-      reason: "soundwalker_pair_fallback",
-    };
-  }
-
-  // 4) 兜底：沿用同名优先，再退化到第一个
-  for (const out of outputInfos) {
-    const matchedInput = inputInfos.find((i) => i.name === out.name);
-    if (matchedInput) {
-      return {
-        input: matchedInput.port,
-        output: out.port,
-        displayName: out.name || matchedInput.name,
-        reason: "matched_name_pair_fallback",
-      };
-    }
-  }
-
-  return {
-    input: inputInfos[0].port,
-    output: outputInfos[0].port,
-    displayName: outputInfos[0].name || inputInfos[0].name || "未知设备",
-    reason: "first_port_fallback",
-  };
 }
 
 function resolveDisplayModel(selectedDisplayName) {
@@ -139,17 +82,6 @@ function resolveDisplayModel(selectedDisplayName) {
     return TUPTUP_MIDI_MODEL;
   }
   return selectedDisplayName;
-}
-
-function logPortList(inputs, outputs) {
-  for (let i = 0; i < inputs.length; i++) {
-    const p = inputs[i];
-    log(`Input[${i}] name=${p.name || ""} manufacturer=${p.manufacturer || ""} id=${p.id || ""}`);
-  }
-  for (let i = 0; i < outputs.length; i++) {
-    const p = outputs[i];
-    log(`Output[${i}] name=${p.name || ""} manufacturer=${p.manufacturer || ""} id=${p.id || ""}`);
-  }
 }
 
 function log(msg) {
@@ -170,19 +102,20 @@ function setStage(text, percent) {
 function setConnected(connected, name = "-") {
   els.connStatus.textContent = connected ? "已连接" : "未连接";
   els.deviceName.textContent = name;
+  if (els.transportName) {
+    els.transportName.textContent = connected
+      ? (state.transportType === "webusb" ? "WebUSB" : state.transportType === "native-usb" ? "Native USB Bridge" : state.transportType)
+      : "-";
+  }
   els.checkBtn.disabled = !connected;
   els.pickFileBtn.disabled = !connected;
+  if (!connected) els.upgradeBtn.disabled = true;
+  else refreshUpgradeButton();
 }
 
-function ensureWebMidi() {
-  if (!navigator.requestMIDIAccess) {
-    throw new Error("当前浏览器不支持 Web MIDI，请使用 Chrome/Edge。");
-  }
-}
-
-function onMidiMessage(event) {
-  const data = Array.from(event.data || []);
-  handleIncomingSysex(data);
+function refreshUpgradeButton() {
+  const hasFirmware = !!(state.localFirmwareLines?.length || state.firmwareInfo?.down_url);
+  els.upgradeBtn.disabled = state.transportType === "none" || !hasFirmware;
 }
 
 function handleIncomingSysex(data) {
@@ -227,10 +160,14 @@ function decodeUsbMidiSysexBytes(rawData) {
     const b1 = rawData[i + 1];
     const b2 = rawData[i + 2];
     const b3 = rawData[i + 3];
-    if (cin === 0x4) bytes.push(b1, b2, b3);
-    else if (cin === 0x5) bytes.push(b1);
-    else if (cin === 0x6) bytes.push(b1, b2);
-    else if (cin === 0x7) bytes.push(b1, b2, b3);
+    const dataLenByCin = {
+      0x2: 2, 0x3: 3, 0x4: 3, 0x5: 1, 0x6: 2, 0x7: 3,
+      0x8: 3, 0x9: 3, 0xa: 3, 0xb: 3, 0xc: 2, 0xd: 2, 0xe: 3, 0xf: 1,
+    };
+    const count = dataLenByCin[cin] || 0;
+    if (count >= 1) bytes.push(b1);
+    if (count >= 2) bytes.push(b2);
+    if (count >= 3) bytes.push(b3);
   }
 
   return bytes;
@@ -253,6 +190,23 @@ function feedUsbSysexBytes(bytes) {
   return messages;
 }
 
+async function transferOutUsbMidiData(device, endpoint, usbData) {
+  const chunkSize = state.usbOutPacketSize || USB_MIDI_SEND_CHUNK_SIZE;
+  let chunks = 0;
+  for (let offset = 0; offset < usbData.length; offset += chunkSize) {
+    const chunk = usbData.subarray(offset, Math.min(offset + chunkSize, usbData.length));
+    const out = await device.transferOut(endpoint, chunk);
+    if (!out || out.status !== "ok") throw new Error(`USB发送失败: ${out?.status || "unknown"}`);
+    chunks++;
+    if (offset + chunkSize < usbData.length) await delay(USB_MIDI_SEND_CHUNK_DELAY_MS);
+  }
+  return chunks;
+}
+
+function getUsbMidiEncodedLength(messageLength) {
+  return Math.ceil(messageLength / 3) * 4;
+}
+
 async function startUsbReadLoop() {
   if (!state.usbDevice || state.usbInEndpoint == null || state.usbReadLoopRunning) return;
   state.usbReadLoopRunning = true;
@@ -273,90 +227,109 @@ async function startUsbReadLoop() {
 }
 
 async function connectWebUsbMidi() {
-  if (!navigator.usb) throw new Error("当前浏览器不支持 WebUSB");
-  const device = await navigator.usb.requestDevice({ filters: [{ classCode: 0x01, subclassCode: 0x03 }] });
-  await device.open();
-  if (!device.configuration) await device.selectConfiguration(1);
+  if (!window.isSecureContext) throw new Error("WebUSB 需要安全上下文，请使用 Chrome/Edge 打开本地 file:// 页面或 HTTPS 页面");
+  if (!navigator.usb) throw new Error("当前浏览器不支持 WebUSB，请使用 Windows 版 Chrome 或 Edge");
+  const device = await navigator.usb.requestDevice({ filters: WEB_USB_DEVICE_FILTERS });
 
-  let found = null;
-  for (const iface of device.configuration.interfaces) {
-    for (const alt of iface.alternates) {
-      if (alt.interfaceClass !== 0x01 || alt.interfaceSubclass !== 0x03) continue;
-      const outEp = alt.endpoints.find((e) => e.direction === "out");
-      const inEp = alt.endpoints.find((e) => e.direction === "in");
-      if (outEp && inEp) {
-        found = { iface, outEp, inEp };
-        break;
+  try {
+    await device.open();
+    if (!device.configuration) await device.selectConfiguration(1);
+
+    let found = null;
+    for (const iface of device.configuration.interfaces) {
+      for (const alt of iface.alternates) {
+        if (alt.interfaceClass !== 0x01 || alt.interfaceSubclass !== 0x03) continue;
+        const outEp = alt.endpoints.find((e) => e.direction === "out");
+        const inEp = alt.endpoints.find((e) => e.direction === "in");
+        if (outEp && inEp) {
+          found = { iface, alt, outEp, inEp };
+          break;
+        }
       }
+      if (found) break;
     }
-    if (found) break;
+    if (!found) throw new Error("未找到可用的USB MIDI端点");
+
+    await device.claimInterface(found.iface.interfaceNumber);
+    if (found.iface.alternate?.alternateSetting !== found.alt.alternateSetting) {
+      await device.selectAlternateInterface(found.iface.interfaceNumber, found.alt.alternateSetting);
+    }
+
+    state.usbDevice = device;
+    state.usbOutEndpoint = found.outEp.endpointNumber;
+    state.usbInEndpoint = found.inEp.endpointNumber;
+    state.usbOutPacketSize = found.outEp.packetSize || USB_MIDI_SEND_CHUNK_SIZE;
+    state.transportType = "webusb";
+    state.sendPacket = async (command) => {
+      const usbData = encodeUsbMidiSysex(command);
+      return await transferOutUsbMidiData(device, state.usbOutEndpoint, usbData);
+    };
+
+    log(`WebUSB端点: interface=${found.iface.interfaceNumber}, in=${state.usbInEndpoint}, out=${state.usbOutEndpoint}, packetSize=${state.usbOutPacketSize}`);
+    startUsbReadLoop();
+    return device;
+  } catch (e) {
+    try {
+      if (device.opened) await device.close();
+    } catch {}
+    const msg = String(e?.message || e || "");
+    if (/claim|access|denied|protected|busy|in use/i.test(msg)) {
+      throw new Error(`WebUSB无法占用USB MIDI接口：${msg}。Windows 可能已用系统 MIDI 驱动占用该接口，需要关闭占用程序，或让设备提供 WinUSB/WebUSB 兼容接口后再测试。`);
+    }
+    throw e;
   }
-  if (!found) throw new Error("未找到可用的USB MIDI端点");
-
-  await device.claimInterface(found.iface.interfaceNumber);
-  state.usbDevice = device;
-  state.usbOutEndpoint = found.outEp.endpointNumber;
-  state.usbInEndpoint = found.inEp.endpointNumber;
-  state.transportType = "webusb";
-  state.sendPacket = async (command) => {
-    const usbData = encodeUsbMidiSysex(command);
-    const out = await device.transferOut(state.usbOutEndpoint, usbData);
-    if (!out || out.status !== "ok") throw new Error(`USB发送失败: ${out?.status || "unknown"}`);
-  };
-
-  startUsbReadLoop();
-  return device;
-}
-
-async function connectMidi() {
-  ensureWebMidi();
-  const midiAccess = await navigator.requestMIDIAccess({ sysex: true });
-  const inputs = Array.from(midiAccess.inputs.values());
-  const outputs = Array.from(midiAccess.outputs.values());
-  if (!inputs.length || !outputs.length) throw new Error("未找到可用 MIDI 输入/输出设备");
-
-  const selected = selectTargetPorts(inputs, outputs);
-  const output = selected.output;
-  const input = selected.input;
-
-  state.midiAccess = midiAccess;
-  state.input = input;
-  state.output = output;
-  state.transportType = "webmidi";
-  state.sendPacket = async (command) => {
-    state.output.send(command);
-  };
-  input.onmidimessage = onMidiMessage;
-
-  const selectedName = selected.displayName || getMidiDisplayName(output) || getMidiDisplayName(input) || "未知设备";
-  const modelName = resolveDisplayModel(selectedName);
-  state.rawDisplayName = modelName;
-  setConnected(true, modelName);
-  log(`设备已连接: ${modelName}`);
-  log(`MIDI枚举: inputs=${inputs.length}, outputs=${outputs.length}`);
-  logPortList(inputs, outputs);
-  log(`端口选择策略: ${selected.reason}`);
-  log(`选中输入: name=${input.name || ""} manufacturer=${input.manufacturer || ""} id=${input.id || ""}`);
-  log(`选中输出: name=${output.name || ""} manufacturer=${output.manufacturer || ""} id=${output.id || ""}`);
-  log(`上报device_model: ${modelName}`);
 }
 
 async function connectDevice() {
-  try {
-    const dev = await connectWebUsbMidi();
-    const selectedName = (dev.productName || "").trim() || "USB MIDI Device";
-    const modelName = resolveDisplayModel(selectedName);
-    state.rawDisplayName = modelName;
-    setConnected(true, modelName);
-    log(`设备已连接(WebUSB): ${modelName}`);
-    log(`WebUSB Device: product=${dev.productName || ""} manufacturer=${dev.manufacturerName || ""}`);
-    log(`WebUSB Endpoints: in=${state.usbInEndpoint}, out=${state.usbOutEndpoint}`);
-    log(`上报device_model: ${modelName}`);
+  if (WINDOWS_WEBUSB_MODE) {
+    const device = await connectWebUsbMidi();
+    const displayName = resolveDisplayModel(device.productName || TUPTUP_MIDI_MODEL);
+    state.rawDisplayName = displayName;
+    setConnected(true, displayName);
+    log(`WebUSB已连接: ${displayName}`);
+    log(`上报device_model: ${displayName}`);
+    try {
+      await queryFirmwareVersion();
+    } catch (e) {
+      log(`设备版本查询未完成: ${e.message}`);
+    }
     return;
-  } catch (e) {
-    log(`WebUSB连接失败，回退WebMIDI: ${e.message}`);
   }
-  await connectMidi();
+
+  let statusResp;
+  try {
+    statusResp = await fetch(BRIDGE_STATUS_URL);
+  } catch {
+    throw new Error("未检测到本地升级助手，请先打开或安装 Mac 版 TUP升级助手");
+  }
+  const status = await statusResp.json().catch(() => ({}));
+  if (!statusResp.ok) throw new Error(status.message || `本地升级助手状态检查失败: HTTP ${statusResp.status}`);
+  if (status.platform && status.platform !== "darwin") {
+    throw new Error(`当前升级助手平台为 ${status.platform}，本版本先支持 Mac`);
+  }
+  log(`升级助手: ${status.name || "TUP Upgrade Bridge"} ${status.version || ""}`);
+
+  const resp = await fetch(NATIVE_USB_PROBE_URL);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.message || `本地USB桥状态检查失败: HTTP ${resp.status}`);
+
+  const interfaces = Array.isArray(data.interfaces) ? data.interfaces : [];
+  const midiInterface = interfaces.find((item) => item.midiStreamingCandidate && item.openName === "success");
+
+  if (!midiInterface) {
+    const failed = interfaces.find((item) => item.midiStreamingCandidate) || interfaces[0];
+    const reason = failed ? `${failed.openName || failed.createPluginName || "unknown"}(${failed.open || failed.createPlugin || ""})` : "未发现USB MIDI streaming接口";
+    throw new Error(`本地USB桥未能打开钢琴USB MIDI接口：${reason}，请关闭占用MIDI的程序或重新插拔设备`);
+  }
+
+  const selectedName = midiInterface.product || "SoundWalker MIDI";
+  const modelName = resolveDisplayModel(selectedName);
+  state.transportType = "native-usb";
+  state.rawDisplayName = modelName;
+  setConnected(true, modelName);
+  log(`本地USB桥已连接: ${modelName}`);
+  log(`USB接口: interface=${midiInterface.number}, endpoints=${midiInterface.endpointCount}, transport=NativeUSB`);
+  log(`上报device_model: ${modelName}`);
 }
 
 function buildControlCommand(cmd, params = []) {
@@ -366,6 +339,10 @@ function buildControlCommand(cmd, params = []) {
 
 function buildDataCommand(cmd, pkt, data) {
   return new Uint8Array([0xF0, 0x53, 0x57, cmd & 0xff, pkt & 0xff, ...data, ETX]);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function waitForResponse(timeoutMs, matcher) {
@@ -381,22 +358,60 @@ function waitForResponse(timeoutMs, matcher) {
         clearTimeout(timer);
         resolve(data);
       },
+      cancel: () => {
+        clearTimeout(timer);
+      },
     };
   });
 }
 
 async function sendAndWait(command, timeoutMs = 5000, matcher) {
   if (!state.sendPacket) throw new Error("设备未连接");
-  await state.sendPacket(command);
-  return await waitForResponse(timeoutMs, matcher);
+  const responsePromise = waitForResponse(timeoutMs, matcher);
+  try {
+    await state.sendPacket(command);
+  } catch (e) {
+    state.responseWaiter?.cancel?.();
+    state.responseWaiter = null;
+    throw e;
+  }
+  return await responsePromise;
 }
 
 function isUpgradeResponse(data) {
-  return data.length >= 6 && data[1] === 0x53 && data[2] === 0x57;
+  return data.length >= 6 && data[0] === 0xF0 && data[1] === 0x53 && data[2] === 0x57 && data[data.length - 1] === ETX;
 }
 
 function isAck(resp) {
   return resp && resp.length >= 6 && resp[5] === RESP.ACK;
+}
+
+function bytesToHex(data) {
+  if (!data || !data.length) return "";
+  return Array.from(data).map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+}
+
+function parseVersionResponse(resp) {
+  if (!resp || resp.length < 10) return "";
+  const majorVersion = resp[7] & 0xff;
+  const minorHigh = resp[8] & 0xff;
+  const minorLow = resp[9] & 0xff;
+  return `V${majorVersion}.${String(minorHigh * 10 + minorLow).padStart(2, "0")}`;
+}
+
+async function queryFirmwareVersion() {
+  log("查询设备固件版本...");
+  const resp = await sendAndWait(buildControlCommand(CMD.VERSION_QUERY, []), TIMEOUT_VERSION_QUERY, isUpgradeResponse);
+  const version = parseVersionResponse(resp);
+  if (!version) {
+    log(`设备版本响应无法解析: ${bytesToHex(resp) || "-"}`);
+    return "";
+  }
+  state.detectedVersion = version;
+  state.currentVersion = version.replace(/^V/i, "");
+  if (els.currentVersion) els.currentVersion.textContent = version;
+  log(`设备固件版本: ${version}`);
+  return version;
 }
 
 function md5Hex(text) {
@@ -459,10 +474,15 @@ function md5Hex(text) {
 
 function getOrCreateUuid() {
   const key = "tuptup_web_uuid";
-  const old = localStorage.getItem(key);
+  let old = "";
+  try {
+    old = window.localStorage?.getItem(key) || "";
+  } catch {}
   if (old) return old;
-  const id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  localStorage.setItem(key, id);
+  const id = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID() : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    window.localStorage?.setItem(key, id);
+  } catch {}
   return id;
 }
 
@@ -537,16 +557,29 @@ async function checkFirmware() {
 }
 
 async function fetchUpgLines(url) {
-  const proxyUrl = `${FIRMWARE_PROXY_URL}?url=${encodeURIComponent(url)}`;
-  log(`[UPG] Proxy Download: ${proxyUrl}`);
-  const resp = await fetch(proxyUrl);
+  const targetUrl = WINDOWS_WEBUSB_MODE ? url : `${FIRMWARE_PROXY_URL}?url=${encodeURIComponent(url)}`;
+  log(WINDOWS_WEBUSB_MODE ? `[UPG] Direct Download: ${targetUrl}` : `[UPG] Proxy Download: ${targetUrl}`);
+  const resp = await fetch(targetUrl);
   if (!resp.ok) throw new Error(`下载固件失败: HTTP ${resp.status}`);
   const text = await resp.text();
-  return text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  return parseUpgText(text);
 }
 
 function parseUpgText(text) {
-  return text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  return text.split(/\r\n|\n|\r/).map(javaTrim).filter(Boolean);
+}
+
+function javaTrim(text) {
+  return text.replace(/^[\x00-\x20]+|[\x00-\x20]+$/g, "");
+}
+
+function encodeAscii(text) {
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    bytes[i] = code <= 0x7F ? code : 0x3F;
+  }
+  return bytes;
 }
 
 function isCorsLikeError(err) {
@@ -556,50 +589,149 @@ function isCorsLikeError(err) {
 
 function isProxyLikelyUnavailable(err) {
   const msg = String(err?.message || err || "").toLowerCase();
+  if (WINDOWS_WEBUSB_MODE) return false;
   if (location.protocol === "file:") return true;
   return msg.includes("failed to fetch") || msg.includes("networkerror") || msg.includes("load failed");
 }
 
 async function transferFirmware(lines) {
+  if (state.transportType === "webusb") return transferFirmwareWebUsb(lines);
+  if (state.transportType !== "native-usb") throw new Error("当前未连接本地USB桥，请重新连接钢琴");
+
+  setStage("准备升级", 0);
+  const resp = await fetch(NATIVE_USB_UPGRADE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lines }),
+  });
+
+  if (!resp.ok || !resp.body) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(text || `本地USB桥升级请求失败: HTTP ${resp.status}`);
+  }
+
+  const decoder = new TextDecoder();
+  const reader = resp.body.getReader();
+  let buffer = "";
+  let bridgeError = "";
+  let success = false;
+
+  const handleEvent = (event) => {
+    if (!event || typeof event !== "object") return;
+    if (event.type === "connected") {
+      log(`NativeUSB桥接: inPipe=${event.inPipe || ""}, outPipe=${event.outPipe || ""}, packetSize=${event.outPacketSize || ""}`);
+      return;
+    }
+    if (event.type === "log" && event.message) {
+      log(event.message);
+      return;
+    }
+    if (event.type === "progress") {
+      setStage(event.stage || "升级中", typeof event.percent === "number" ? event.percent : undefined);
+      return;
+    }
+    if (event.type === "success") {
+      success = true;
+      return;
+    }
+    if (event.type === "error") {
+      bridgeError = event.message || "本地USB桥升级失败";
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const linesOut = buffer.split(/\r?\n/);
+    buffer = linesOut.pop() || "";
+    for (const line of linesOut) {
+      if (!line.trim()) continue;
+      try {
+        handleEvent(JSON.parse(line));
+      } catch {
+        log(line);
+      }
+    }
+  }
+
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    try {
+      handleEvent(JSON.parse(buffer));
+    } catch {
+      log(buffer.trim());
+    }
+  }
+
+  if (bridgeError) throw new Error(bridgeError);
+  if (!success) throw new Error("本地USB桥升级未返回成功状态");
+}
+
+function dataAckTimeoutMs(commandLength) {
+  const extra = Math.ceil(commandLength / 256) * 3000;
+  return Math.min(30000, Math.max(TIMEOUT_DATA_TRANSFER, TIMEOUT_DATA_TRANSFER + extra));
+}
+
+async function transferFirmwareWebUsb(lines) {
+  if (state.transportType !== "webusb") throw new Error("当前未通过 WebUSB 连接钢琴，请重新连接");
+  if (!lines.length) throw new Error("固件文件为空");
+
   setStage("初始化", 0);
-  let resp = await sendAndWait(buildControlCommand(CMD.INIT, []), 5000, isUpgradeResponse);
-  if (!isAck(resp)) throw new Error("初始化失败：未收到ACK");
+  log("WebUSB发送初始化命令...");
+  const initResp = await sendAndWait(buildControlCommand(CMD.INIT, []), TIMEOUT_INIT, isUpgradeResponse);
+  if (!isAck(initResp)) throw new Error(`初始化失败：${bytesToHex(initResp) || "未收到ACK"}`);
+  await delay(200);
 
   setStage("传输中", 1);
-  for (let i = 0; i < lines.length; i++) {
-    const cmd = CMD.DATA_BASE + Math.floor(i / LINES_PER_CMD);
-    const pkt = i % LINES_PER_CMD;
-    const lineBytes = new TextEncoder().encode(lines[i]);
-    const msgSize = 6 + lineBytes.length; // F0 53 57 CMD PKT [data] F7
-    if (i < 5) {
-      log(`发送行${i + 1}: dataLen=${lineBytes.length}, sysexLen=${msgSize}`);
+  log(`WebUSB开始传输固件，共 ${lines.length} 行`);
+  for (let index = 0; index < lines.length; index++) {
+    const cmd = (CMD.DATA_BASE + Math.floor(index / LINES_PER_CMD)) & 0xff;
+    const pkt = index % LINES_PER_CMD;
+    const lineBytes = encodeAscii(lines[index]);
+    const command = buildDataCommand(cmd, pkt, lineBytes);
+    const timeoutMs = dataAckTimeoutMs(command.length);
+
+    if (index < 5) {
+      log(`发送行${index + 1}: dataLen=${lineBytes.length}, sysexLen=${command.length}, timeout=${timeoutMs}ms, transport=WebUSB`);
     }
 
     let ok = false;
+    let lastError = "";
     for (let retry = 1; retry <= MAX_RETRY; retry++) {
       try {
-        resp = await sendAndWait(buildDataCommand(cmd, pkt, lineBytes), 5000, isUpgradeResponse);
+        const resp = await sendAndWait(command, timeoutMs, isUpgradeResponse);
         if (isAck(resp)) {
           ok = true;
           break;
         }
-        if (resp[5] === RESP.CRC_ERROR) log(`第${i + 1}行 CRC 错误，重试 ${retry}/${MAX_RETRY}`);
-        else log(`第${i + 1}行 NAK/异常响应，重试 ${retry}/${MAX_RETRY}`);
-      } catch {
-        log(`第${i + 1}行 超时，重试 ${retry}/${MAX_RETRY}`);
+        if (resp && resp[5] === RESP.CRC_ERROR) {
+          lastError = "CRC错误";
+          log(`第${index + 1}行 CRC 错误，重试 ${retry}/${MAX_RETRY}`);
+        } else {
+          lastError = `异常响应 ${bytesToHex(resp) || "-"}`;
+          log(`第${index + 1}行 ${lastError}，重试 ${retry}/${MAX_RETRY}`);
+        }
+      } catch (e) {
+        lastError = e.message;
+        log(`第${index + 1}行 等待ACK失败(${e.message})，重试 ${retry}/${MAX_RETRY}`);
       }
-      await new Promise((r) => setTimeout(r, 100));
+      if (retry < MAX_RETRY) await delay(100);
     }
-    if (!ok) throw new Error(`数据传输失败，行号 ${i + 1}`);
 
-    if (i % 10 === 0 || i === lines.length - 1) {
-      setStage("传输中", Math.floor(((i + 1) * 100) / lines.length));
+    if (!ok) throw new Error(`数据传输失败，行号 ${index + 1}: ${lastError}`);
+
+    if ((index + 1) % 10 === 0 || index + 1 === lines.length) {
+      const percent = Math.floor(((index + 1) * 100) / lines.length);
+      setStage("传输中", percent);
+      log(`已发送 ${index + 1}/${lines.length} 行，进度 ${percent}%`);
     }
   }
 
   setStage("结束中", 99);
-  resp = await sendAndWait(buildControlCommand(CMD.FINISH, [0x04]), 10000, isUpgradeResponse);
-  if (!isAck(resp)) throw new Error("结束升级失败：未收到ACK");
+  log("WebUSB发送结束命令...");
+  const finishResp = await sendAndWait(buildControlCommand(CMD.FINISH, [PARAM_TRANSFER_END]), TIMEOUT_FINISH, isUpgradeResponse);
+  if (!isAck(finishResp)) throw new Error(`结束升级失败：${bytesToHex(finishResp) || "未收到ACK"}`);
   setStage("升级成功", 100);
 }
 
@@ -618,17 +750,20 @@ els.checkBtn.addEventListener("click", async () => {
     log("开始检查固件更新...");
     const data = await checkFirmware();
     const fw = data.latest_firmware;
-    state.firmwareInfo = fw;
+    state.firmwareInfo = data.has_update ? fw : null;
     els.latestVersion.textContent = fw?.firmware_version || "-";
     els.fileSize.textContent = fw?.file_size ? `${(fw.file_size / 1024 / 1024).toFixed(2)} MB` : "-";
     els.releaseNote.textContent = `更新说明：\n${fw?.release_note || "-"}`;
-    els.upgradeBtn.disabled = !(data.has_update && fw?.down_url);
+    refreshUpgradeButton();
     setStage(data.has_update ? "检测到新版本" : "已是最新", 0);
     log(data.has_update ? `发现新版本 ${fw?.firmware_version}` : "当前已是最新版本");
   } catch (e) {
     setStage("检查失败", 0);
-    log(`检查失败: ${e.message}`);
-    alert(e.message);
+    const message = WINDOWS_WEBUSB_MODE && isCorsLikeError(e)
+      ? "检查更新接口被浏览器跨域策略阻止，请改用“选择本地固件”测试升级"
+      : e.message;
+    log(`检查失败: ${message}`);
+    alert(message);
   }
 });
 
@@ -649,6 +784,10 @@ els.upgradeBtn.addEventListener("click", async () => {
           throw new Error("代理服务不可用，请先启动本地 server.js 并从 127.0.0.1:8080 访问页面");
         }
         if (isCorsLikeError(e)) {
+          if (WINDOWS_WEBUSB_MODE) {
+            log("直接下载失败（可能被浏览器跨域策略阻止），请改用“选择本地固件”。");
+            throw new Error("浏览器直接下载固件失败，请先选择本地 .upg 固件文件再升级");
+          }
           log("下载失败（可能跨域或网络异常），请检查代理服务日志。");
           throw new Error("固件下载失败，请检查代理服务是否正常");
         }
@@ -664,7 +803,7 @@ els.upgradeBtn.addEventListener("click", async () => {
     log(`升级失败: ${e.message}`);
     alert(e.message);
   } finally {
-    els.upgradeBtn.disabled = false;
+    refreshUpgradeButton();
   }
 });
 
@@ -682,7 +821,7 @@ els.firmwareFileInput.addEventListener("change", async (event) => {
     if (!lines.length) throw new Error("本地固件文件为空或格式不正确");
     state.localFirmwareLines = lines;
     state.localFirmwareName = file.name;
-    els.upgradeBtn.disabled = false;
+    refreshUpgradeButton();
     log(`已选择本地固件: ${file.name}，共 ${lines.length} 行`);
   } catch (e) {
     state.localFirmwareLines = null;
@@ -692,6 +831,22 @@ els.firmwareFileInput.addEventListener("change", async (event) => {
   }
 });
 
+if (navigator.usb) {
+  navigator.usb.addEventListener("disconnect", (event) => {
+    if (state.usbDevice && event.device === state.usbDevice) {
+      state.transportType = "none";
+      state.sendPacket = null;
+      state.usbDevice = null;
+      state.usbReadLoopRunning = false;
+      state.responseWaiter?.cancel?.();
+      state.responseWaiter = null;
+      setConnected(false);
+      setStage("已断开", 0);
+      log("WebUSB设备已断开");
+    }
+  });
+}
+
 if (els.currentVersion) els.currentVersion.textContent = state.currentVersion;
 setConnected(false);
-log("页面已就绪，等待连接钢琴。");
+log(WINDOWS_WEBUSB_MODE ? "Windows WebUSB测试页已就绪，等待连接钢琴。" : "页面已就绪，等待连接钢琴。");

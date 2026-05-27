@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -euo pipefail
+
+APP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+RESOURCE_DIR="$APP_ROOT/Resources/bridge"
+BRIDGE_SERVER="$RESOURCE_DIR/bridge_server"
+
+if [[ ! -x "$BRIDGE_SERVER" ]]; then
+  osascript -e 'display dialog "升级助手组件缺失，请重新安装。" buttons {"好"} default button 1' >/dev/null 2>&1 || true
+  exit 1
+fi
+
+export HOST="${HOST:-127.0.0.1}"
+export PORT="${PORT:-18080}"
+export BRIDGE_ALLOWED_ORIGINS="${BRIDGE_ALLOWED_ORIGINS:-http://127.0.0.1:8080,http://127.0.0.1:18080,http://localhost:8080,http://localhost:18080,https://upgrade.xhsmartpiano.com}"
+
+cd "$RESOURCE_DIR"
+"$BRIDGE_SERVER" &
+BRIDGE_PID=$!
+
+open "http://127.0.0.1:${PORT}/api/bridge/status" >/dev/null 2>&1 || true
+wait "$BRIDGE_PID"

@@ -1,0 +1,12 @@
+{
+  "name": "tup-vers-upgrade",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "HOST=127.0.0.1 PORT=18080 node server.js",
+    "build:mac": "scripts/build-macos-bridge.sh",
+    "package:mac": "scripts/package-macos-dmg.sh",
+    "install:mac": "macos/install-launch-agent.sh",
+    "uninstall:mac": "macos/uninstall-launch-agent.sh"
+  }
+}
