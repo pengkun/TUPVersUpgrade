@@ -3,20 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Windows WebUSB 固件升级测试</title>
+  <title>Windows 浏览器固件升级测试</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <main class="layout">
     <section class="guide">
-      <h1>Windows WebUSB 固件升级测试</h1>
+      <h1>Windows 浏览器固件升级测试</h1>
       <p class="sub">请先按图示让钢琴进入升级模式，再连接 USB。</p>
       <img src="./gif_ota_1.gif" alt="升级模式指引" class="guide-image" />
     </section>
 
     <section class="panel">
       <div class="row">
-        <button id="connectBtn">连接钢琴(WebUSB)</button>
+        <button id="connectBtn">连接钢琴</button>
         <button id="checkBtn" disabled>检查更新</button>
         <button id="upgradeBtn" disabled>开始升级</button>
         <button id="pickFileBtn" disabled>选择本地固件</button>
@@ -42,6 +42,7 @@
 
       <pre id="releaseNote" class="release-note">测试说明：
 - 推荐使用 Windows 版 Chrome/Edge 直接打开本文件。
+- 页面会先测试 WebUSB；如果浏览器禁止占用 USB MIDI 接口，会自动改用 Web MIDI + SysEx。
 - 不启动本地服务时，远程固件下载可能被浏览器跨域策略阻止，可先用“选择本地固件”测试升级链路。</pre>
       <pre id="log" class="log"></pre>
     </section>

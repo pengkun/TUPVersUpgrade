@@ -56,6 +56,9 @@ const els = {
 };
 
 const state = {
+  midiAccess: null,
+  input: null,
+  output: null,
   transportType: "none",
   sendPacket: null,
   usbDevice: null,
@@ -84,6 +87,63 @@ function resolveDisplayModel(selectedDisplayName) {
   return selectedDisplayName;
 }
 
+function getMidiDisplayName(port) {
+  return (port?.name || "").trim();
+}
+
+function isTupTupName(name) {
+  return /^tuptup/i.test((name || "").trim());
+}
+
+function selectTargetPorts(inputs, outputs) {
+  const inputInfos = inputs.map((port) => ({ port, name: getMidiDisplayName(port) }));
+  const outputInfos = outputs.map((port) => ({ port, name: getMidiDisplayName(port) }));
+
+  for (const out of outputInfos) {
+    if (!isTupTupName(out.name)) continue;
+    const matchedInput = inputInfos.find((i) => i.name === out.name && isTupTupName(i.name));
+    if (matchedInput) return { input: matchedInput.port, output: out.port, displayName: out.name, reason: "matched_tuptup_pair" };
+  }
+
+  const tupOut = outputInfos.find((o) => isTupTupName(o.name));
+  if (tupOut) {
+    const matchedInput = inputInfos.find((i) => i.name === tupOut.name) || inputInfos[0];
+    return { input: matchedInput.port, output: tupOut.port, displayName: tupOut.name, reason: "tuptup_output_fallback_input" };
+  }
+
+  for (const out of outputInfos) {
+    if (!isSoundWalkerName(out.name)) continue;
+    const matchedInput =
+      inputInfos.find((i) => i.name === out.name) ||
+      inputInfos.find((i) => isSoundWalkerName(i.name)) ||
+      inputInfos[0];
+    return { input: matchedInput.port, output: out.port, displayName: out.name, reason: "soundwalker_pair_fallback" };
+  }
+
+  for (const out of outputInfos) {
+    const matchedInput = inputInfos.find((i) => i.name === out.name);
+    if (matchedInput) {
+      return { input: matchedInput.port, output: out.port, displayName: out.name || matchedInput.name, reason: "matched_name_pair_fallback" };
+    }
+  }
+
+  return {
+    input: inputInfos[0].port,
+    output: outputInfos[0].port,
+    displayName: outputInfos[0].name || inputInfos[0].name || "未知设备",
+    reason: "first_port_fallback",
+  };
+}
+
+function logMidiPortList(inputs, outputs) {
+  inputs.forEach((port, index) => {
+    log(`MIDI Input[${index}] name=${port.name || ""} manufacturer=${port.manufacturer || ""} id=${port.id || ""}`);
+  });
+  outputs.forEach((port, index) => {
+    log(`MIDI Output[${index}] name=${port.name || ""} manufacturer=${port.manufacturer || ""} id=${port.id || ""}`);
+  });
+}
+
 function log(msg) {
   const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   els.log.textContent += `[${now}] ${msg}\n`;
@@ -104,7 +164,7 @@ function setConnected(connected, name = "-") {
   els.deviceName.textContent = name;
   if (els.transportName) {
     els.transportName.textContent = connected
-      ? (state.transportType === "webusb" ? "WebUSB" : state.transportType === "native-usb" ? "Native USB Bridge" : state.transportType)
+      ? (state.transportType === "webusb" ? "WebUSB" : state.transportType === "webmidi" ? "Web MIDI" : state.transportType === "native-usb" ? "Native USB Bridge" : state.transportType)
       : "-";
   }
   els.checkBtn.disabled = !connected;
@@ -188,6 +248,16 @@ function feedUsbSysexBytes(bytes) {
     }
   }
   return messages;
+}
+
+function onMidiMessage(event) {
+  const data = Array.from(event.data || []);
+  handleIncomingSysex(data);
+}
+
+function isProtectedWebUsbError(error) {
+  const msg = String(error?.message || error || "").toLowerCase();
+  return msg.includes("protected class") || msg.includes("claiminterface") || msg.includes("claim interface");
 }
 
 async function transferOutUsbMidiData(device, endpoint, usbData) {
@@ -280,14 +350,61 @@ async function connectWebUsbMidi() {
   }
 }
 
+async function connectWebMidi() {
+  if (!navigator.requestMIDIAccess) throw new Error("当前浏览器不支持 Web MIDI，请使用 Windows 版 Chrome 或 Edge");
+
+  const midiAccess = await navigator.requestMIDIAccess({ sysex: true });
+  const inputs = Array.from(midiAccess.inputs.values());
+  const outputs = Array.from(midiAccess.outputs.values());
+  if (!inputs.length || !outputs.length) throw new Error("未找到可用 MIDI 输入/输出设备");
+
+  const selected = selectTargetPorts(inputs, outputs);
+  const input = selected.input;
+  const output = selected.output;
+  if (!input || !output) throw new Error("未找到可用 MIDI 输入/输出端口");
+
+  await input.open?.();
+  await output.open?.();
+  input.onmidimessage = onMidiMessage;
+
+  state.midiAccess = midiAccess;
+  state.input = input;
+  state.output = output;
+  state.transportType = "webmidi";
+  state.sendPacket = async (command) => {
+    output.send(command);
+  };
+
+  const selectedName = selected.displayName || getMidiDisplayName(output) || getMidiDisplayName(input) || "USB MIDI Device";
+  const modelName = resolveDisplayModel(selectedName);
+  state.rawDisplayName = modelName;
+  setConnected(true, modelName);
+  log(`Web MIDI已连接: ${modelName}`);
+  log(`MIDI枚举: inputs=${inputs.length}, outputs=${outputs.length}`);
+  logMidiPortList(inputs, outputs);
+  log(`MIDI端口选择策略: ${selected.reason}`);
+  log(`选中输入: name=${input.name || ""} manufacturer=${input.manufacturer || ""} id=${input.id || ""}`);
+  log(`选中输出: name=${output.name || ""} manufacturer=${output.manufacturer || ""} id=${output.id || ""}`);
+  log(`上报device_model: ${modelName}`);
+  return { input, output, displayName: modelName };
+}
+
 async function connectDevice() {
   if (WINDOWS_WEBUSB_MODE) {
-    const device = await connectWebUsbMidi();
-    const displayName = resolveDisplayModel(device.productName || TUPTUP_MIDI_MODEL);
-    state.rawDisplayName = displayName;
-    setConnected(true, displayName);
-    log(`WebUSB已连接: ${displayName}`);
-    log(`上报device_model: ${displayName}`);
+    try {
+      const device = await connectWebUsbMidi();
+      const displayName = resolveDisplayModel(device.productName || TUPTUP_MIDI_MODEL);
+      state.rawDisplayName = displayName;
+      setConnected(true, displayName);
+      log(`WebUSB已连接: ${displayName}`);
+      log(`上报device_model: ${displayName}`);
+    } catch (e) {
+      log(`WebUSB直连不可用: ${e.message}`);
+      if (!isProtectedWebUsbError(e)) throw e;
+      log("该设备的USB MIDI接口属于浏览器保护类，自动改用 Web MIDI + SysEx 连接。");
+      await connectWebMidi();
+    }
+
     try {
       await queryFirmwareVersion();
     } catch (e) {
@@ -595,7 +712,7 @@ function isProxyLikelyUnavailable(err) {
 }
 
 async function transferFirmware(lines) {
-  if (state.transportType === "webusb") return transferFirmwareWebUsb(lines);
+  if (state.transportType === "webusb" || state.transportType === "webmidi") return transferFirmwareBrowser(lines);
   if (state.transportType !== "native-usb") throw new Error("当前未连接本地USB桥，请重新连接钢琴");
 
   setStage("准备升级", 0);
@@ -673,18 +790,19 @@ function dataAckTimeoutMs(commandLength) {
   return Math.min(30000, Math.max(TIMEOUT_DATA_TRANSFER, TIMEOUT_DATA_TRANSFER + extra));
 }
 
-async function transferFirmwareWebUsb(lines) {
-  if (state.transportType !== "webusb") throw new Error("当前未通过 WebUSB 连接钢琴，请重新连接");
+async function transferFirmwareBrowser(lines) {
+  if (state.transportType !== "webusb" && state.transportType !== "webmidi") throw new Error("当前未通过浏览器连接钢琴，请重新连接");
   if (!lines.length) throw new Error("固件文件为空");
+  const transportLabel = state.transportType === "webmidi" ? "Web MIDI" : "WebUSB";
 
   setStage("初始化", 0);
-  log("WebUSB发送初始化命令...");
+  log(`${transportLabel}发送初始化命令...`);
   const initResp = await sendAndWait(buildControlCommand(CMD.INIT, []), TIMEOUT_INIT, isUpgradeResponse);
   if (!isAck(initResp)) throw new Error(`初始化失败：${bytesToHex(initResp) || "未收到ACK"}`);
   await delay(200);
 
   setStage("传输中", 1);
-  log(`WebUSB开始传输固件，共 ${lines.length} 行`);
+  log(`${transportLabel}开始传输固件，共 ${lines.length} 行`);
   for (let index = 0; index < lines.length; index++) {
     const cmd = (CMD.DATA_BASE + Math.floor(index / LINES_PER_CMD)) & 0xff;
     const pkt = index % LINES_PER_CMD;
@@ -693,7 +811,7 @@ async function transferFirmwareWebUsb(lines) {
     const timeoutMs = dataAckTimeoutMs(command.length);
 
     if (index < 5) {
-      log(`发送行${index + 1}: dataLen=${lineBytes.length}, sysexLen=${command.length}, timeout=${timeoutMs}ms, transport=WebUSB`);
+      log(`发送行${index + 1}: dataLen=${lineBytes.length}, sysexLen=${command.length}, timeout=${timeoutMs}ms, transport=${transportLabel}`);
     }
 
     let ok = false;
@@ -729,7 +847,7 @@ async function transferFirmwareWebUsb(lines) {
   }
 
   setStage("结束中", 99);
-  log("WebUSB发送结束命令...");
+  log(`${transportLabel}发送结束命令...`);
   const finishResp = await sendAndWait(buildControlCommand(CMD.FINISH, [PARAM_TRANSFER_END]), TIMEOUT_FINISH, isUpgradeResponse);
   if (!isAck(finishResp)) throw new Error(`结束升级失败：${bytesToHex(finishResp) || "未收到ACK"}`);
   setStage("升级成功", 100);
@@ -849,4 +967,4 @@ if (navigator.usb) {
 
 if (els.currentVersion) els.currentVersion.textContent = state.currentVersion;
 setConnected(false);
-log(WINDOWS_WEBUSB_MODE ? "Windows WebUSB测试页已就绪，等待连接钢琴。" : "页面已就绪，等待连接钢琴。");
+log(WINDOWS_WEBUSB_MODE ? "Windows浏览器测试页已就绪，等待连接钢琴。" : "页面已就绪，等待连接钢琴。");
