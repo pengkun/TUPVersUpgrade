@@ -174,8 +174,9 @@ function setConnected(connected, name = "-") {
 }
 
 function refreshUpgradeButton() {
-  const hasFirmware = !!(state.localFirmwareLines?.length || state.firmwareInfo?.down_url);
-  els.upgradeBtn.disabled = state.transportType === "none" || !hasFirmware;
+  const hasLocalFirmware = !!state.localFirmwareLines?.length;
+  const hasRemoteFirmware = !WINDOWS_WEBUSB_MODE && !!state.firmwareInfo?.down_url;
+  els.upgradeBtn.disabled = state.transportType === "none" || !(hasLocalFirmware || hasRemoteFirmware);
 }
 
 function handleIncomingSysex(data) {
@@ -674,6 +675,7 @@ async function checkFirmware() {
 }
 
 async function fetchUpgLines(url) {
+  if (WINDOWS_WEBUSB_MODE) throw new Error("Windows无服务测试页不下载远程固件，请选择本地 .upg 文件");
   const targetUrl = WINDOWS_WEBUSB_MODE ? url : `${FIRMWARE_PROXY_URL}?url=${encodeURIComponent(url)}`;
   log(WINDOWS_WEBUSB_MODE ? `[UPG] Direct Download: ${targetUrl}` : `[UPG] Proxy Download: ${targetUrl}`);
   const resp = await fetch(targetUrl);
@@ -868,13 +870,20 @@ els.checkBtn.addEventListener("click", async () => {
     log("开始检查固件更新...");
     const data = await checkFirmware();
     const fw = data.latest_firmware;
-    state.firmwareInfo = data.has_update ? fw : null;
+    state.firmwareInfo = !WINDOWS_WEBUSB_MODE && data.has_update ? fw : null;
     els.latestVersion.textContent = fw?.firmware_version || "-";
     els.fileSize.textContent = fw?.file_size ? `${(fw.file_size / 1024 / 1024).toFixed(2)} MB` : "-";
-    els.releaseNote.textContent = `更新说明：\n${fw?.release_note || "-"}`;
+    const releaseNote = fw?.release_note || "-";
+    els.releaseNote.textContent = WINDOWS_WEBUSB_MODE
+      ? `更新说明：\n${releaseNote}\n\nWindows无服务测试页不会下载远程固件，请使用“选择本地固件”加载 .upg 文件。`
+      : `更新说明：\n${releaseNote}`;
     refreshUpgradeButton();
-    setStage(data.has_update ? "检测到新版本" : "已是最新", 0);
-    log(data.has_update ? `发现新版本 ${fw?.firmware_version}` : "当前已是最新版本");
+    setStage(data.has_update ? (WINDOWS_WEBUSB_MODE ? "检测到新版本，请选择本地固件" : "检测到新版本") : "已是最新", 0);
+    if (data.has_update && WINDOWS_WEBUSB_MODE) {
+      log(`发现新版本 ${fw?.firmware_version}，Windows无服务模式不下载远程固件，请选择本地 .upg 文件升级`);
+    } else {
+      log(data.has_update ? `发现新版本 ${fw?.firmware_version}` : "当前已是最新版本");
+    }
   } catch (e) {
     setStage("检查失败", 0);
     const message = WINDOWS_WEBUSB_MODE && isCorsLikeError(e)
@@ -886,6 +895,12 @@ els.checkBtn.addEventListener("click", async () => {
 });
 
 els.upgradeBtn.addEventListener("click", async () => {
+  if (WINDOWS_WEBUSB_MODE && !state.localFirmwareLines?.length) {
+    const message = "Windows无服务测试页不下载远程固件，请先点击“选择本地固件”选择 .upg 文件";
+    log(message);
+    alert(message);
+    return;
+  }
   if (!state.firmwareInfo?.down_url && !state.localFirmwareLines) return;
   try {
     els.upgradeBtn.disabled = true;
